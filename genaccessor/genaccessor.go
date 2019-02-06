@@ -93,11 +93,18 @@ func Run(targetDir string, newWriter func(pkg *ast.Package) io.Writer, opts ...O
 						continue
 					}
 
-					fieldTypeText := field.Type().String()
-					if namedDef, isNamed := field.Type().(*types.Named); isNamed &&
+					typ := field.Type()
+					pointerMark := ""
+					if pointerDef, isPointer := field.Type().(*types.Pointer); isPointer {
+						pointerMark = "*"
+						typ = pointerDef.Elem()
+					}
+
+					fieldTypeText := pointerMark + typ.String()
+					if namedDef, isNamed := typ.(*types.Named); isNamed &&
 						namedDef.Obj().Pkg() != nil &&
 						namedDef.Obj().Pkg().Path() != "" {
-						fieldTypeText = namedDef.Obj().Pkg().Name() + "." + namedDef.Obj().Name()
+						fieldTypeText = pointerMark + namedDef.Obj().Pkg().Name() + "." + namedDef.Obj().Name()
 						importPackages = append(importPackages, namedDef.Obj().Pkg())
 					}
 
