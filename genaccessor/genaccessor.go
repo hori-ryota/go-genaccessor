@@ -106,7 +106,7 @@ func Run(targetDir string, newWriter func(pkg *ast.Package) io.Writer, opts ...O
 								if len(ss) == 2 {
 									for i := range file.Imports {
 										if file.Imports[i].Name == nil {
-											if path.Base(file.Imports[i].Path.Value) != ss[0] {
+											if path.Base(strings.Trim(file.Imports[i].Path.Value, `"`)) != ss[0] {
 												continue
 											}
 											importPackages = append(importPackages, file.Imports[i])
