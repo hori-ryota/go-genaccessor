@@ -60,7 +60,19 @@ func Run(targetDir string, newWriter func(pkg *ast.Package) io.Writer, opts ...O
 	for _, pkg := range pkgMap {
 		body := new(bytes.Buffer)
 		importPackages := make([]*ast.ImportSpec, 0, 10)
-		for _, file := range pkg.Files {
+
+		// sort filelist by name
+		sortedFileNameList := make([]string, 0, len(pkg.Files))
+		for name := range pkg.Files {
+			sortedFileNameList = append(sortedFileNameList, name)
+		}
+		sort.Strings(sortedFileNameList)
+		sortedFileList := make([]*ast.File, len(pkg.Files))
+		for i, name := range sortedFileNameList {
+			sortedFileList[i] = pkg.Files[name]
+		}
+
+		for _, file := range sortedFileList {
 			for _, decl := range file.Decls {
 				decl, ok := decl.(*ast.GenDecl)
 				if !ok {
