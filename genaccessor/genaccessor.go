@@ -1,3 +1,18 @@
+/*
+genaccessor is accsessor generator for Go.
+
+```go
+    type Foo struct {
+        key string `getter:"[alias,]..." setter:"[alias,]..."`
+    }
+```
+
+with `go generate` command
+
+```go
+    //go:generate go-genaccessor
+```
+*/
 package genaccessor
 
 import (
