@@ -17,21 +17,16 @@ package genaccessor
 
 import (
 	"bytes"
-	"fmt"
 	"go/ast"
 	"go/format"
-	"go/parser"
-	"go/printer"
-	"go/token"
 	"io"
 	"os"
-	"path"
-	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"text/template"
-	"unicode"
+
+	"github.com/hori-ryota/go-genutil/genutil"
+	"github.com/hori-ryota/go-strcase"
 )
 
 type Option func(o *option)
@@ -61,103 +56,51 @@ func Run(targetDir string, newWriter func(pkg *ast.Package) io.Writer, opts ...O
 		opt(&option)
 	}
 
-	fset := token.NewFileSet()
-	pkgMap, err := parser.ParseDir(
-		fset,
-		filepath.FromSlash(targetDir),
-		option.fileFilter,
-		0,
-	)
+	walkers, err := genutil.DirToAstWalker(targetDir, option.fileFilter)
 	if err != nil {
 		return err
 	}
 
-	for _, pkg := range pkgMap {
+	for _, walker := range walkers {
 		body := new(bytes.Buffer)
-		importPackages := make([]*ast.ImportSpec, 0, 10)
-
-		// sort filelist by name
-		sortedFileNameList := make([]string, 0, len(pkg.Files))
-		for name := range pkg.Files {
-			sortedFileNameList = append(sortedFileNameList, name)
-		}
-		sort.Strings(sortedFileNameList)
-		sortedFileList := make([]*ast.File, len(pkg.Files))
-		for i, name := range sortedFileNameList {
-			sortedFileList[i] = pkg.Files[name]
-		}
-
-		for _, file := range sortedFileList {
-			for _, decl := range file.Decls {
-				decl, ok := decl.(*ast.GenDecl)
-				if !ok {
+		importPackages := make(map[string]string, 10)
+		for _, spec := range walker.AllStructSpecs() {
+			structType := spec.Type.(*ast.StructType)
+			for _, field := range structType.Fields.List {
+				if field.Tag == nil {
 					continue
 				}
-				if decl.Tok != token.TYPE {
-					continue
+				tag := reflect.StructTag(strings.Trim(field.Tag.Value, "`"))
+
+				typePrinter, err := walker.ToTypePrinter(field.Type)
+				if err != nil {
+					return err
 				}
-				for _, spec := range decl.Specs {
-					spec := spec.(*ast.TypeSpec)
-					structType, ok := spec.Type.(*ast.StructType)
-					if !ok {
+
+				for _, accessorTmpl := range accessorTmpls {
+					methodNamesText, hasTag := tag.Lookup(accessorTmpl.tagKey)
+					if !hasTag {
 						continue
 					}
-					for _, field := range structType.Fields.List {
-						if field.Tag == nil {
-							continue
-						}
-						tag := reflect.StructTag(strings.Trim(field.Tag.Value, "`"))
 
-						b := new(bytes.Buffer)
-						err := printer.Fprint(b, fset, field.Type)
-						if err != nil {
-							return err
-						}
-						fieldTypeText := b.String()
+					fieldName := genutil.ParseFieldName(field)
+					methodNames := []string{accessorTmpl.defaultMethodName(fieldName)}
+					if len(methodNamesText) != 0 {
+						methodNames = strings.Split(methodNamesText, ",")
+					}
 
-						for _, genMethod := range genMethods {
-							methodNamesText, hasTag := tag.Lookup(genMethod.tagKey)
-							if !hasTag {
-								continue
-							}
+					for n, pkg := range typePrinter.ImportPkgMap(walker.PkgPath) {
+						importPackages[n] = pkg
+					}
 
-							methodNames := []string{genMethod.defaultMethodName(field.Names[0].Name)}
-							if len(methodNamesText) != 0 {
-								methodNames = strings.Split(methodNamesText, ",")
-							}
-
-							for _, s := range strings.FieldsFunc(fieldTypeText, func(c rune) bool {
-								return !unicode.IsLetter(c) && c != '.'
-							}) {
-								ss := strings.SplitN(s, ".", 2)
-								if len(ss) == 2 {
-									for i := range file.Imports {
-										if file.Imports[i].Name == nil {
-											if path.Base(strings.Trim(file.Imports[i].Path.Value, `"`)) != ss[0] {
-												continue
-											}
-											importPackages = append(importPackages, file.Imports[i])
-											break
-										}
-										if file.Imports[i].Name.Name != ss[0] {
-											continue
-										}
-										importPackages = append(importPackages, file.Imports[i])
-										break
-									}
-								}
-							}
-
-							for _, methodName := range methodNames {
-								if err := genMethod.tmpl.Execute(body, tmplParam{
-									StructName: spec.Name.Name,
-									MethodName: methodName,
-									FieldType:  fieldTypeText,
-									FieldName:  field.Names[0].Name,
-								}); err != nil {
-									panic(err)
-								}
-							}
+					for _, methodName := range methodNames {
+						if err := accessorTmpl.tmpl.Execute(body, tmplParam{
+							StructName: spec.Name.Name,
+							MethodName: methodName,
+							FieldType:  typePrinter.Print(walker.PkgPath),
+							FieldName:  fieldName,
+						}); err != nil {
+							panic(err)
 						}
 					}
 				}
@@ -179,8 +122,8 @@ func Run(targetDir string, newWriter func(pkg *ast.Package) io.Writer, opts ...O
 			{{ .Body }}
 		`)).Execute(out, map[string]string{
 			"GeneratorName":  option.generatorName,
-			"PackageName":    pkg.Name,
-			"ImportPackages": fmtImports(importPackages, fset),
+			"PackageName":    walker.Pkg.Name,
+			"ImportPackages": genutil.GoFmtImports(importPackages),
 			"Body":           body.String(),
 		})
 		if err != nil {
@@ -191,7 +134,7 @@ func Run(targetDir string, newWriter func(pkg *ast.Package) io.Writer, opts ...O
 		if err != nil {
 			return err
 		}
-		writer := newWriter(pkg)
+		writer := newWriter(walker.Pkg)
 		if closer, ok := writer.(io.Closer); ok {
 			defer closer.Close()
 		}
@@ -210,7 +153,7 @@ type tmplParam struct {
 	FieldName  string
 }
 
-var genMethods = []struct {
+var accessorTmpls = []struct {
 	tagKey            string
 	tmpl              *template.Template
 	defaultMethodName func(filedName string) string
@@ -222,7 +165,7 @@ func (m {{ .StructName }}) {{ .MethodName }}() {{ .FieldType }} {
 				return m.{{ .FieldName }}
 			}
 		`)),
-		defaultMethodName: toUpperCamel,
+		defaultMethodName: strcase.ToUpperCamel,
 	},
 	{
 		tagKey: "setter",
@@ -232,109 +175,7 @@ func (m *{{ .StructName }}) {{ .MethodName }}(s {{ .FieldType }}) {
 			}
 		`)),
 		defaultMethodName: func(fieldName string) string {
-			return "Set" + toUpperCamel(fieldName)
+			return "Set" + strcase.ToUpperCamel(fieldName)
 		},
 	},
-}
-
-func toUpperCamel(s string) string {
-	if s == "" {
-		return s
-	}
-	firstNotLowerIndex := strings.IndexFunc(s, func(c rune) bool {
-		return !unicode.IsLower(c)
-	})
-	if firstNotLowerIndex == -1 {
-		firstNotLowerIndex = len(s)
-	}
-	if commonInitialisms[s[:firstNotLowerIndex]] {
-		return strings.ToUpper(s[:firstNotLowerIndex]) + s[firstNotLowerIndex:]
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
-}
-
-// from https://github.com/golang/lint
-var commonInitialisms = map[string]bool{
-	"acl":   true,
-	"api":   true,
-	"ascii": true,
-	"cpu":   true,
-	"css":   true,
-	"dns":   true,
-	"eof":   true,
-	"guid":  true,
-	"html":  true,
-	"http":  true,
-	"https": true,
-	"id":    true,
-	"ip":    true,
-	"json":  true,
-	"lhs":   true,
-	"qps":   true,
-	"ram":   true,
-	"rhs":   true,
-	"rpc":   true,
-	"sla":   true,
-	"smtp":  true,
-	"sql":   true,
-	"ssh":   true,
-	"tcp":   true,
-	"tls":   true,
-	"ttl":   true,
-	"udp":   true,
-	"ui":    true,
-	"uid":   true,
-	"uuid":  true,
-	"uri":   true,
-	"url":   true,
-	"utf8":  true,
-	"vm":    true,
-	"xml":   true,
-	"xmpp":  true,
-	"xsrf":  true,
-	"xss":   true,
-}
-
-func fmtImports(pkgs []*ast.ImportSpec, fset *token.FileSet) string {
-	if len(pkgs) == 0 {
-		return ""
-	}
-
-	groups := make([][]*ast.ImportSpec, 2)
-
-	for _, pkg := range pkgs {
-		if len(strings.Split(pkg.Path.Value, "/")) < 3 && !strings.Contains(pkg.Path.Value, ".") {
-			groups[0] = append(groups[0], pkg)
-			continue
-		}
-		groups[1] = append(groups[1], pkg)
-	}
-
-	b := new(bytes.Buffer)
-	for _, group := range groups {
-		group := group
-		sort.Slice(group, func(i, j int) bool {
-			return group[i].Path.Value < group[j].Path.Value
-		})
-		for _, pkg := range group {
-			err := printer.Fprint(b, fset, pkg)
-			if err != nil {
-				panic(err)
-			}
-			_, err = b.WriteRune('\n')
-			if err != nil {
-				panic(err)
-			}
-		}
-		_, err := b.WriteRune('\n')
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	return fmt.Sprintf(`import (
-%s
-		)`,
-		b.String(),
-	)
 }
